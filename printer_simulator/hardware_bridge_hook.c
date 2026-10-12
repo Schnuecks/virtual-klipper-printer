@@ -132,8 +132,17 @@ static void hw_report_slow(const char *what, const char *key, double start_ms) {
         probe_log("slow %s %s: %.2f ms", what, key, ms);
 }
 
+
+// The LD_PRELOAD is inherited by every process start_mcu.sh spawns (bash, sudo, chrt, sleep);
+// the constructors below must act only in the MCU itself.
+static int hw_is_mcu(void) {
+    extern char *program_invocation_short_name;
+    return strcmp(program_invocation_short_name, "klipper.elf") == 0;
+}
+
 __attribute__((constructor(1001)))
 static void hw_lock_memory(void) {
+    if (!hw_is_mcu()) return;
     if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
         fprintf(stderr, "[fake_hw] MCU memory locked (mlockall)\n");
         return;
@@ -322,6 +331,7 @@ static void init_probe_funcs(void) {
 }
 
 static pid_t probe_main_tid;
+static int probe_main_cpu = -1;
 static volatile long probe_armed_ns;        // absolute CLOCK_MONOTONIC alarm the MCU waits for, 0 = none
 static volatile long probe_sleep_since_ns;  // > 0 while the main thread sits in ppoll()
 static volatile long probe_progress_ns;     // last time the main thread passed a probe point
@@ -425,7 +435,18 @@ static char probe_state(void) {
 }
 
 static void *probe_watchdog(void *arg) {
-    (void)arg;
+    int cpu = (int)(long)arg;
+    // SIGALRM is the MCU's alarm and process-directed; if it lands on this thread the main
+    // thread keeps sleeping in ppoll. Block it here so the kernel always delivers it to main.
+    sigset_t alarm;
+    sigemptyset(&alarm);
+    sigaddset(&alarm, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &alarm, NULL);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+    int is_main_cpu = (cpu == probe_main_cpu);
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     long busy_since = 0, asleep_reported = 0, last_wd_report = 0;
@@ -437,9 +458,11 @@ static void *probe_watchdog(void *arg) {
         long now = probe_now_ns();
         long target = next.tv_sec * 1000000000L + next.tv_nsec;
         if (now - target > 1000000L && now - last_wd_report > 100000000L) {
-            probe_log("watchdog late: woke %.2f ms after its 1 ms tick (CPU or system stall)", (now - target) / 1e6);
+            probe_log("watchdog cpu%d late: woke %.2f ms after its 1 ms tick%s", cpu, (now - target) / 1e6,
+                      is_main_cpu ? " (MCU's CPU)" : " (other CPU)");
             last_wd_report = now;
         }
+        if (!is_main_cpu) continue;
         long sleeping = probe_sleep_since_ns, armed = probe_armed_ns, prog = probe_progress_ns;
         if (sleeping) {
             if (armed > 1000000L && now - armed > 2000000L && asleep_reported != armed) {
@@ -468,24 +491,38 @@ static void *probe_watchdog(void *arg) {
 
 __attribute__((constructor(1002)))
 static void probe_start(void) {
+    if (!hw_is_mcu()) return;
     init_probe_funcs();
     probe_main_tid = (pid_t)syscall(SYS_gettid);
-    int cpu = sched_getcpu();
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    // FAKE_HW_CPU=<n> pins the MCU to that CPU, otherwise to the one it starts on
+    int cpu = getenv("FAKE_HW_CPU") ? atoi(getenv("FAKE_HW_CPU")) : sched_getcpu();
+    if (cpu < 0 || cpu >= ncpu) cpu = 0;
     cpu_set_t set;
     CPU_ZERO(&set);
-    if (cpu >= 0) {
-        CPU_SET(cpu, &set);
-        if (sched_setaffinity(0, sizeof(set), &set) != 0) cpu = -1;
-    }
+    CPU_SET(cpu, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) cpu = -1;
+    probe_main_cpu = cpu;
+    // a second watchdog on another CPU tells a system-wide stall (both late) from one that
+    // only hits the MCU's CPU
+    int other = (cpu + 1) % ncpu;
+    // start the watchdogs with SIGALRM blocked so the alarm can never be delivered to them
+    sigset_t alarm, old;
+    sigemptyset(&alarm);
+    sigaddset(&alarm, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &alarm, &old);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256 * 1024);  // small: the stack is locked by MCL_FUTURE
-    if (cpu >= 0) pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
     pthread_t th;
-    int ret = pthread_create(&th, &attr, probe_watchdog, NULL);
+    int ret = pthread_create(&th, &attr, probe_watchdog, (void *)(long)cpu);
+    int ret2 = ncpu > 1 ? pthread_create(&th, &attr, probe_watchdog, (void *)(long)other) : -1;
     pthread_attr_destroy(&attr);
-    probe_log("stall probe: main tid %d on cpu %d, watchdog thread %s", (int)probe_main_tid, cpu,
-              ret == 0 ? "started" : strerror(ret));
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    probe_log("stall probe: main tid %d on cpu %d, watchdog on cpu %d %s, second watchdog on cpu %d %s",
+              (int)probe_main_tid, cpu, cpu, ret == 0 ? "started" : strerror(ret),
+              other, ret2 == 0 ? "started" : (ncpu > 1 ? strerror(ret2) : "skipped"));
 }
 
 // ─────────────────────────────────────────────────────────
