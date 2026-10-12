@@ -11,5 +11,17 @@ if sudo -n chrt -f -p 50 "$pid" 2>/dev/null; then
 else
   echo "klipper_mcu: no realtime priority (start the container with --cap-add SYS_NICE)"
 fi
+# debug: the hook's watchdog thread must run above the main thread; the MCU re-execs
+# itself on every restart, so re-apply the priorities every 2 s
+(
+  while kill -0 "$pid" 2>/dev/null; do
+    for t in /proc/"$pid"/task/*; do
+      tid=${t##*/}
+      [ "$tid" = "$pid" ] && continue
+      sudo -n chrt -f -p 51 "$tid" 2>/dev/null
+    done
+    sleep 2
+  done
+) &
 trap 'kill "$pid" 2>/dev/null' TERM INT
 wait "$pid"
